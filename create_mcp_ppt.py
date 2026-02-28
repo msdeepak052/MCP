@@ -5,7 +5,7 @@ from pptx.enum.text import PP_ALIGN
 from pptx.oxml.ns import qn
 from lxml import etree
 
-# ── Color Palette ──────────────────────────────────────────────
+# ── Color Palete ──────────────────────────────────────────────
 BG        = RGBColor(0x0D, 0x1B, 0x2A)   # dark navy
 PANEL     = RGBColor(0x16, 0x2B, 0x3C)   # slightly lighter panel
 ACCENT    = RGBColor(0x00, 0xB4, 0xD8)   # cyan
