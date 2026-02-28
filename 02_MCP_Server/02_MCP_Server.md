@@ -175,17 +175,21 @@ LOCAL SERVER                          REMOTE SERVER
 Runs on your own machine              Runs on a cloud server or VM
 Only you can use it                   Multiple users can connect
 Fast (no network delay)               Accessible from anywhere
-Uses STDIO transport                  Uses HTTP+SSE or WebSocket
+Uses STDIO transport                  Uses Streamable HTTP transport
 Examples: read files, run scripts     Examples: cloud APIs, shared DBs
 ```
 
-The **transport** is the communication method the Client uses to talk to the Server. There are three:
+The **transport** is the communication method the Client uses to talk to the Server.
+The MCP spec (as of **2025-03-26**) defines exactly **two official transports**:
 
 | Transport | Where Server Runs | Best For |
 |-----------|------------------|----------|
 | **STDIO** | Local (same machine) | Simple local tools |
-| **HTTP + SSE** | Remote (any machine) | Cloud services, shared tools |
-| **WebSocket** | Remote (real-time) | Streaming, live updates |
+| **Streamable HTTP** | Remote (any machine) | Cloud services, shared tools, streaming |
+
+> **Note:** The old `HTTP + SSE` transport (spec version `2024-11-05`) is **deprecated**.
+> WebSocket is **not** an official MCP transport — it can be used as a custom transport
+> but is not part of the standard spec.
 
 ---
 
@@ -249,84 +253,190 @@ Claude Desktop runs that `npx` command, launching the Server as a child process,
 
 ---
 
-## 7. Transport 2 — HTTP + SSE (Remote)
+## 7. Transport 2 — Streamable HTTP (Remote)
 
-### What is HTTP + SSE?
+> **Spec version:** `2025-03-26`
+> **Replaces:** the deprecated `HTTP + SSE` transport from spec `2024-11-05`
 
-- **HTTP POST** — the Client sends requests to the Server over normal HTTP
-- **SSE (Server-Sent Events)** — the Server streams responses back to the Client over a persistent HTTP connection
+### Why the old HTTP + SSE was replaced
 
-This is a **one-direction stream** from server to client (SSE), combined with normal HTTP for client-to-server messages.
+The original remote transport used **two separate endpoints** — one for sending (`/sse/messages`) and one for receiving (`/sse`). This caused real problems:
 
-### How it works
+| Problem | Impact |
+|---------|--------|
+| Two endpoints to manage | Extra complexity in both client and server code |
+| Persistent SSE connection always required | Hard to scale — every client held an open connection |
+| Tokens passed in URL query string | Security risk — credentials exposed in logs and browser history |
+| Connection drop = lost response | No built-in recovery mechanism |
+| One-way SSE | Artificial split between send and receive channels |
+
+### What is Streamable HTTP?
+
+Streamable HTTP solves all of the above by using a **single MCP endpoint** (e.g. `https://example.com/mcp`) that supports both POST and GET.
+
+- **Simple responses** → server replies with plain `application/json`
+- **Streaming responses** → server upgrades the reply to an `text/event-stream` (SSE) automatically, only when needed
+- No permanent open connection required — stateless servers are now possible
 
 ```
-CLIENT MACHINE                          REMOTE SERVER
-┌─────────────┐                        ┌──────────────────────┐
-│             │  HTTP POST /message    │                      │
-│   Client    │ ──────────────────────>│   MCP Server         │
-│             │                        │   (always running)   │
-│             │ <──────────────────────│                      │
-│             │  SSE stream /events    │                      │
-└─────────────┘                        └──────────────────────┘
-     any machine                            cloud / VM / server
+CLIENT                              REMOTE SERVER
+┌─────────────┐                    ┌─────────────────────────┐
+│             │  POST /mcp         │                         │
+│   Client    │ ─────────────────> │   MCP Server            │
+│             │                    │   (single endpoint)     │
+│             │ <─────────────────│                         │
+│             │  JSON  OR  SSE     │  responds with plain    │
+│             │  (server decides)  │  JSON or SSE stream     │
+└─────────────┘                    └─────────────────────────┘
 ```
 
-### Step-by-step flow
+### How it works — step by step
 
 ```
-1. Client connects to the Server's SSE endpoint
-   GET https://myserver.com/events
-
-2. Server keeps that connection open — this is the response channel
-
-3. When Client wants to call a tool:
-   POST https://myserver.com/message
+1. CLIENT SENDS A REQUEST
+   POST https://example.com/mcp
+   Headers:
+     Accept: application/json, text/event-stream
+     Mcp-Session-Id: 1868a90c...         ← after session is created
    Body: { "method": "tools/call", "params": { ... } }
 
-4. Server processes it and sends the result back via the SSE stream
-   data: { "result": "file contents here" }
+2. SERVER DECIDES HOW TO RESPOND:
+
+   Simple response (no streaming needed):
+     Content-Type: application/json
+     Body: { "result": "..." }
+
+   Streaming response (long-running tool / progress updates):
+     Content-Type: text/event-stream
+     data: { "progress": "step 1 done" }
+     data: { "progress": "step 2 done" }
+     data: { "result": "final answer" }
+
+3. CLIENT CAN ALSO OPEN A LISTENER CHANNEL
+   GET https://example.com/mcp
+   Headers:
+     Accept: text/event-stream
+     Mcp-Session-Id: 1868a90c...
+
+   → Server can push notifications to the client at any time
+     without waiting for a client request
+```
+
+### Session Management
+
+Streamable HTTP adds proper **session tracking** via a header — no more tokens in URLs:
+
+```
+1. Client sends InitializeRequest (POST /mcp, no session ID yet)
+
+2. Server responds with InitializeResult and assigns a session:
+   HTTP 200
+   Mcp-Session-Id: 1868a90c-d4f3-4e2b-9a1c-...
+
+3. Client includes this header on every subsequent request:
+   POST /mcp
+   Mcp-Session-Id: 1868a90c-d4f3-4e2b-9a1c-...
+
+4. To end the session cleanly:
+   DELETE /mcp
+   Mcp-Session-Id: 1868a90c-d4f3-4e2b-9a1c-...
+```
+
+Session IDs must be **cryptographically secure** (UUID, JWT, or a hash). No guessable IDs.
+
+### Resumability
+
+If a streaming connection drops mid-response, the client can resume it:
+
+```
+1. Server attaches an ID to each SSE event:
+   id: evt-042
+   data: { "progress": "halfway done" }
+
+2. Connection drops unexpectedly.
+
+3. Client reconnects:
+   GET /mcp
+   Last-Event-Id: evt-042
+
+4. Server replays events from evt-042 onward — no data lost.
 ```
 
 ### Practical example
 
-A team deploys a shared Postgres MCP Server on a VM. Any developer with Claude Desktop can connect to it:
+A team deploys a shared Postgres MCP Server on a VM. Any developer can connect to it:
 
 ```json
 {
   "mcpServers": {
     "postgres": {
-      "url": "https://mcp.mycompany.com/postgres"
+      "url": "https://mcp.mycompany.com/mcp"
     }
   }
 }
 ```
 
-No installation needed on the developer's machine — the Server is already running remotely.
+The client POSTs every tool call to `/mcp`. The server responds with JSON for quick
+queries and upgrades to SSE for long-running ones — automatically, no config needed.
+
+### FastMCP — switching to Streamable HTTP
+
+```python
+# STDIO (local) — default
+mcp.run(transport="stdio")
+
+# Streamable HTTP (remote)
+mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
+```
 
 ### Pros and Cons
 
 | Pros | Cons |
 |------|------|
-| Accessible from any machine | More setup (server, domain, TLS) |
-| Multiple Clients can share one Server | SSE is one-directional (Client can't push data back easily) |
-| Server runs independently and persistently | Slightly more latency than STDIO |
-| Works through firewalls and proxies | Need to handle auth, security |
+| Single endpoint — simpler to build and deploy | More setup than STDIO (server, domain, TLS) |
+| Stateless servers now possible — easy to scale | Need to implement auth properly |
+| Streams only when needed — efficient | Slightly more latency than STDIO |
+| Secure session management via headers | Newer — less tooling than old SSE |
+| Built-in resumability on dropped connections | |
 
-### When to use HTTP + SSE
+### When to use Streamable HTTP
 
+- Any remote MCP Server (this is now the standard)
+- Sharing tools across a team on a VM or Kubernetes
 - Connecting to cloud services (Slack, GitHub, Notion)
-- Sharing a tool with your team (shared DB server)
-- Deploying MCP Servers on VMs or Kubernetes
-- Any tool that needs to be accessible remotely
+- Servers that may have both quick and long-running tools
+
+### What about the old HTTP + SSE?
+
+The `HTTP + SSE` transport is **officially deprecated** as of MCP spec `2025-03-26`.
+
+- Old servers still work — the spec includes backward compatibility guidelines
+- New servers should use Streamable HTTP from the start
+- If you hit an old server, clients fall back to SSE automatically
+
+```
+Client behaviour when connecting to an unknown server:
+
+  1. Try: POST /mcp with InitializeRequest
+     Success → new Streamable HTTP server
+
+  2. Fails with 404/405?
+     Fallback: GET /sse — treat as old HTTP+SSE server
+```
 
 ---
 
-## 8. Transport 3 — WebSocket (Real-Time Remote)
+## 8. WebSocket — Custom Transport (Not in Official Spec)
+
+> **Important:** WebSocket is **not** an officially defined MCP transport.
+> The MCP spec (`2025-03-26`) only defines **STDIO** and **Streamable HTTP**.
+> WebSocket can be used as a **custom transport** — the spec allows this — but it is
+> not standard and not guaranteed to be supported by all MCP clients and hosts.
 
 ### What is WebSocket?
 
-WebSocket is a **full-duplex** (two-way) communication channel over a single persistent connection. Unlike HTTP+SSE where the Client sends HTTP POST and Server streams back via SSE, with WebSocket **both sides can send messages at any time**.
+WebSocket is a **full-duplex** (two-way) persistent connection over a single TCP socket.
+Both sides can send messages at any time without waiting for the other.
 
 ```
 CLIENT                              SERVER
@@ -334,49 +444,49 @@ CLIENT                              SERVER
   │──── WebSocket Handshake ─────────>│
   │<─── Connection Established ───────│
   │                                   │
-  │──── tool call ──────────────────> │  ← Client can send anytime
-  │<─── result ──────────────────────│  ← Server can send anytime
-  │<─── progress update ─────────────│  ← Server can push mid-stream
+  │──── tool call ──────────────────> │  ← Client sends anytime
+  │<─── result ──────────────────────│  ← Server responds anytime
+  │<─── progress update ─────────────│  ← Server pushes updates
   │──── another request ────────────> │
   │                                   │
-  (connection stays open)
+  (connection stays open indefinitely)
 ```
 
-### How it differs from HTTP + SSE
+### How it compares to Streamable HTTP
 
-| Feature | HTTP + SSE | WebSocket |
-|---------|-----------|-----------|
-| Communication | Client POST → Server SSE stream | Fully two-way |
-| Connection | New HTTP request per call | One persistent connection |
-| Server can push anytime | Yes (via SSE) | Yes (natively) |
-| Streaming mid-response | Limited | Natural |
-| Complexity | Simpler | Slightly more complex |
+| Feature | Streamable HTTP | WebSocket |
+|---------|----------------|-----------|
+| In official MCP spec | YES | NO (custom only) |
+| Connection model | Request-per-call (stateless possible) | Persistent connection always |
+| Server push | Via SSE when needed | Native, anytime |
+| Streaming | Upgrades to SSE automatically | Always streaming-ready |
+| Scalability | Easy (stateless) | Harder (persistent conn per client) |
+| Standard support | All MCP hosts | Only hosts that implement it |
 
-### When to use WebSocket
+### When does WebSocket still make sense?
 
-- **Long-running tools** — e.g., "run this build and stream logs back"
-- **Real-time tools** — e.g., "watch this file and notify when it changes"
-- **Streaming responses** — e.g., "run kubectl logs -f and stream output"
-- Any tool where the Server needs to push **multiple updates** over time
+Even though it is not in the spec, some frameworks and custom deployments use WebSocket for:
 
-### Practical example
+- **Very high frequency tool calls** — persistent connection avoids HTTP overhead per call
+- **True real-time push** — server needs to push events to client without any request
+- **Legacy infrastructure** — some environments are already built on WebSocket
+
+### The practical reality
+
+For most use cases, **Streamable HTTP already handles streaming** — it upgrades to an
+SSE stream for long-running tools automatically. You do not need WebSocket for log
+streaming or progress updates anymore.
 
 ```
-User: "Stream logs from the production pod"
+Streamable HTTP already covers:
+  Short tool call  → plain JSON response
+  Long tool call   → automatic SSE stream with progress
+  Server push      → GET /mcp opens an SSE listener channel
 
-Client ──WebSocket──> MCP Server
-
-Server starts kubectl logs -f and pushes each log line
-as it arrives back to the Client:
-
-  data: "[10:01:01] Request received"
-  data: "[10:01:02] Processing..."
-  data: "[10:01:03] Done"
-  data: "[10:01:05] New request received"
-  ...
+WebSocket adds value only if:
+  → You need a persistent always-on bidirectional connection
+  → Your client/host explicitly supports it as a custom transport
 ```
-
-This is impossible with normal HTTP (which closes after one response) and awkward with SSE. WebSocket makes it natural.
 
 ---
 
@@ -389,17 +499,19 @@ Is the server running on the same machine as the Client?
 │
 ├── YES → Use STDIO
 │         Simple. Fast. No networking needed.
-│         Best for: local files, scripts, SQLite
+│         Best for: local files, scripts, SQLite, dev/testing
 │
-└── NO → Does the tool need real-time streaming or push updates?
+└── NO  → Use Streamable HTTP  (the official remote standard)
+          Single /mcp endpoint, JSON or SSE depending on the tool
+          Best for: cloud APIs, shared team tools, Kubernetes,
+                    long-running tools, log streaming, remote DBs
           │
-          ├── YES → Use WebSocket
-          │         Best for: log streaming, live monitoring,
-          │         long-running commands
-          │
-          └── NO → Use HTTP + SSE
-                    Best for: cloud APIs, shared team tools,
-                    REST-based integrations
+          └── Need a persistent always-on bidirectional connection?
+              AND your client explicitly supports it?
+              │
+              └── YES → Consider WebSocket (custom transport)
+                        Not in the MCP spec — use only if you have
+                        a specific reason STDIO/Streamable HTTP won't work
 ```
 
 ### Summary table
@@ -409,11 +521,13 @@ Is the server running on the same machine as the Client?
 | Read files from my own machine | STDIO |
 | Query a local SQLite DB | STDIO |
 | Run a local Python script | STDIO |
-| Connect to a company-shared Postgres server | HTTP + SSE |
-| Access a cloud API (Slack, GitHub) | HTTP + SSE |
-| Stream Kubernetes logs live | WebSocket |
-| Watch a file for changes in real time | WebSocket |
-| Build and share a team tool on a VM | HTTP + SSE |
+| Develop and test a new server locally | STDIO |
+| Connect to a company-shared Postgres server | Streamable HTTP |
+| Access a cloud API (Slack, GitHub, Notion) | Streamable HTTP |
+| Stream Kubernetes logs live | Streamable HTTP (auto SSE) |
+| Watch a file for changes in real time | Streamable HTTP (server push via GET) |
+| Build and share a tool on a VM or Kubernetes | Streamable HTTP |
+| Need persistent bidirectional connection (custom) | WebSocket (not standard) |
 
 ---
 
@@ -1233,23 +1347,30 @@ A program that **gives the AI access to your systems** by exposing Tools, Resour
 
 To replace **custom one-off integrations** with a **reusable, standard capability provider** that any MCP-compatible AI app can use.
 
-### The three transports at a glance
+### Transports at a glance
 
 ```
-STDIO
-  Where:  Same machine as Client
-  How:    stdin / stdout pipes
-  Use:    Local files, scripts, dev/testing
+STDIO                          (official — local)
+  Where:   Same machine as Client
+  How:     stdin / stdout pipes
+  Use:     Local files, scripts, dev/testing
 
-HTTP + SSE
-  Where:  Remote machine / cloud
-  How:    HTTP POST (request) + SSE stream (response)
-  Use:    Shared tools, cloud services, team deployments
+Streamable HTTP                (official — remote, spec 2025-03-26)
+  Where:   Remote machine / cloud
+  How:     POST /mcp  →  JSON or SSE (server decides)
+           GET  /mcp  →  SSE listener for server push
+  Session: Mcp-Session-Id header
+  Use:     Shared tools, cloud services, team deployments,
+           streaming, long-running commands
 
-WebSocket
-  Where:  Remote machine / cloud
-  How:    Persistent two-way connection
-  Use:    Real-time streaming, long-running commands, live updates
+WebSocket                      (custom — not in official spec)
+  Where:   Remote machine / cloud
+  How:     Persistent two-way TCP connection
+  Use:     Only if you specifically need always-on bidirectional
+           comms and your host supports it
+
+DEPRECATED — do not use for new servers:
+  HTTP + SSE  (spec 2024-11-05)
 ```
 
 ### The one-liner
