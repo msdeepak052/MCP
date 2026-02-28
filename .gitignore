@@ -37,6 +37,7 @@ desktop.ini
 secrets.json
 *.lock
 .python-version
+uv.lock
 
 
 # ── Logs ──────────────────────────────────────────────────────────
@@ -44,3 +45,8 @@ secrets.json
 
 # ── Node (if any JS tools used) ───────────────────────────────────
 node_modules/
+
+# ── Project root files to exclude ─────────────────────────────────
+pyproject.toml
+main.py
+dd.txt
