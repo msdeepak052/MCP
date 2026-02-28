@@ -35,6 +35,9 @@ desktop.ini
 *.key
 *.pem
 secrets.json
+*.lock
+.python-version
+
 
 # ── Logs ──────────────────────────────────────────────────────────
 *.log
