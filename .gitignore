@@ -1,16 +1,22 @@
-# ── Python ────────────────────────────────────────────────────────
-*.py
+# ── Python bytecode & cache ───────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
+
+# ── Python packaging artifacts ────────────────────────────────────
 *.egg-info/
 dist/
 build/
+
+# ── Virtual environments ──────────────────────────────────────────
 .venv/
 venv/
 env/
+
+# ── uv ────────────────────────────────────────────────────────────
+# uv.lock is intentionally NOT ignored — commit it for reproducibility
 
 # ── Claude ────────────────────────────────────────────────────────
 .claude/
